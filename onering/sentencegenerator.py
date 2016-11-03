@@ -2,7 +2,8 @@
 
 import re
 import random
-import sys
+import sys, os
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Markov Sentence Generator
 
@@ -127,7 +128,7 @@ def genSentence(markovLength):
 
 def generateSentences(markovLength=5):
     # 5, because duh
-    buildMapping(wordlist("english.txt"), markovLength)
+    buildMapping(wordlist(BASE_DIR+"english.txt"), markovLength)
     sentences = ""
     x=0
     while x < 3:
