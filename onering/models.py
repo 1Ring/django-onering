@@ -11,43 +11,50 @@ import utils
 from sentencegenerator import generateSentences
 from bitcoinrpc.authproxy import AuthServiceProxy, JSONRPCException
 from signmessage import sign_and_verify
-import json
+import json, base64
 from io import BytesIO
 import pickle
 
+def commit_object(obj_type,obj,iden):
+    data = BytesIO()
+    creator = iden.Key("m").TaoAddress()
+    pickle.dump(obj,data)
+    enc = iden.Key("m").Encrypt(data.getvalue())
+    msg = binascii.hexlify(hasher(enc))
+    sig = iden.Key("m").Sign(msg)
+    if iden.Key("m").Verify(sig,msg):
+        id_data = {
+            "data":base64.b64encode(enc),
+            "test":settings.DEBUG,
+            "version":utils.DATA_VERSION,
+            "signature":sig,
+            "creator":creator,
+            "object":obj_type,
+        }
+        json_data = json.dumps(id_data) 
+        try:
+            rpc_connection = AuthServiceProxy("http://%s:%s@%s"%(settings.TAO_WALLET['rpc_user'], settings.TAO_WALLET['rpc_password'],settings.TAO_WALLET['host'].replace("http://","")))
+        except:
+            raise Exception("Connection to wallet failed.")
+        try:
+            data = rpc_connection.sendtoaddress("TZJozAg1ruapycCicgz31GxvYJ1G1qELV7",0.001,json_data,binascii.hexlify(utils.APP_ID)[0:40])
+        except:
+            raise Exception ("RPC failed.")
+    else:
+        raise Exception("Signature failed.")
+
 class Identity(models.Model):
-    public_key = None
-    private_key = None
     paragraph = models.CharField(max_length=800,null=True, blank=True)
-    def save_to_blockchain(self,action):
+    def save_to_blockchain(self):
         if settings.TAO_WALLET is None:
             raise ValueError('The Tao Wallet is not configured!')
-        if action == "create":
-            pubkey = binascii.hexlify(self.Key("m").PublicKey())
-            creator = self.Key("m").TaoAddress()
-            data = BytesIO()
-            temp = self
-            temp.paragraph = self.Key("m").Encrypt(self.paragraph)
-            pickle.dump(self,data)
-            msg = binascii.hexlify(hasher(data.getvalue()))
-            sig = sign_and_verify(self.Key("m").TaoWalletImportFormat(),msg,creator)
-            id_data = {
-                "data":binascii.hexlify(data.getvalue()),
-                "test":settings.DEBUG,
-                "version":utils.DATA_VERSION,
-                "signature":sig,
-                "creator":creator,
-                "object":"identity",
-            }
-            json_data = json.dumps(id_data) 
-            rpc_connection = AuthServiceProxy("http://%s:%s@%s"%(settings.TAO_WALLET['rpc_user'], settings.TAO_WALLET['rpc_password'],settings.TAO_WALLET['host'].replace("http://","")))
-            data = rpc_connection.sendtoaddress("TZJozAg1ruapycCicgz31GxvYJ1G1qELV7",0.001,json_data,binascii.hexlify(utils.APP_ID)[0:40])
+        commit_object("identity",obj,self)
     def create(self,paragraph=None):
         if self.paragraph is None:
             self.paragraph = generateSentences()
         else:
             self.paragraph = paragraph
-        self.save_to_blockchain("create")
+        self.save_to_blockchain()
     def passphrase(self):
         return hasher(self.paragraph)
     def Keyring(self,password=None):
@@ -92,23 +99,8 @@ class Key(models.Model):
     identity = models.ForeignKey("Identity",null=False, blank=True)
     def save_to_blockchain(self,action):
         if settings.TAO_WALLET is None:
-            raise ValueError('The Tao Wallet is not configured!')
-        if action=="key":
-            data = BytesIO()
-            pickle.dump(self,data)
-            msg = binascii.hexlify(hasher(data.getvalue()))
-            sig = sign_and_verify(self.identity.Key("m").TaoWalletImportFormat(),msg,self.identity.Key("m").TaoAddress())
-            final = {
-                "data":binascii.hexlify(data.getvalue()),
-                "test":settings.DEBUG,
-                "version":utils.DATA_VERSION,
-                "signature":sig,
-                "creator":self.identity.Key("m").TaoAddress(),
-                "object":"key",
-            }
-            json_data = json.dumps(final) 
-            rpc_connection = AuthServiceProxy("http://%s:%s@%s"%(settings.TAO_WALLET['rpc_user'], settings.TAO_WALLET['rpc_password'],settings.TAO_WALLET['host'].replace("http://","")))
-            data = rpc_connection.sendtoaddress("TZJozAg1ruapycCicgz31GxvYJ1G1qELV7",0.001,json_data,binascii.hexlify(utils.APP_ID)[0:40])
+            raise Exception('The Tao Wallet is not configured!')
+        commit_object("key",obj,self)
     def get_keyspec(self):
         return binascii.unhexlify(self.keyspec)
     def set_keyspec(self, ks):
@@ -123,16 +115,16 @@ class Key(models.Model):
         return self
     def __unicode__(self):
        return self.TaoAddress()
-    def Encrypt(self,msg):
+    def Encrypt(self):
         return self.identity.Keyring(self.identity.passphrase()).FromKeyspec(self.get_keyspec()).Encrypt(msg)        
     def BitcoinWalletImportFormat(self):
         return self.identity.Keyring(self.identity.passphrase()).FromKeyspec(self.get_keyspec()).BitcoinWalletImportFormat()        
     def TaoWalletImportFormat(self):
         return self.identity.Keyring(self.identity.passphrase()).FromKeyspec(self.get_keyspec()).TaoWalletImportFormat()        
     def Sign(self,message):
-        return sign_and_verify(self.TaoWalletImportFormat(), message, self.TaoAddress(), True)
+        return self.identity.Keyring(self.identity.passphrase()).FromKeyspec(self.get_keyspec()).Sign(message)
     def Verify(self,signature, message):
-        return verify_message(self.TaoAddress(),signature,message)
+        return self.identity.Keyring(self.identity.passphrase()).FromKeyspec(self.get_keyspec()).Verify(signature,message,self.TaoAddres())
     def PrivateKey(self):
         return self.identity.Keyring(self.identity.passphrase()).FromKeyspec(self.get_keyspec()).PrivateKey()
     def PublicKey(self):

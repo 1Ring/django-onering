@@ -60,6 +60,7 @@ import utils
 from Crypto.Cipher import AES
 from utils import hasher
 from coins import COINS
+import zlib
 
 _HARDEN    = 0x80000000 # choose from hardened set of child keys
 
@@ -74,7 +75,18 @@ CONFIG  =   {
 oneringversion='0.0.1'
 def create_keyspec():
     return binascii.hexlify(CreateKeyspec())
-
+def varint(size):
+    # Variable length integer encoding:
+    # https://en.bitcoin.it/wiki/Protocol_documentation
+    if size < 0xFD:
+        return struct.pack(b'<B', size)
+    elif size <= 0xFFFF:
+        return b'\xFD' + struct.pack(b'<H', size)
+    elif size <= 0xFFFFFFFF:
+        return b'\xFE' + struct.pack(b'<I', size)
+    else:
+        return b'\xFF' + struct.pack(b'<Q', size)
+    
 class Key(object):
     # Normal class initializer
     def __init__(self, secret, chain, depth, index, fpr, coin='1Ring', testnet=False, public=False):
@@ -115,29 +127,70 @@ class Key(object):
             self.network = 'test'
         else:
             self.network = 'main'
+        self.msgprefix=b'Tao Signed Message:\n'
 
     def negative_self(self, point):
         return ecdsa.ellipticcurve.Point( point.curve(), point.x(), -point.y(), point.order() )
+
     def ser( self, point, comp=True ):
         x = point.x()
         y = point.y()
         if comp:
             return ( ('%02x'%(2+(y&1)))+('%064x'%x) ).decode('hex')
         return ( '04'+('%064x'%x)+('%064x'%y) ).decode('hex')
-        
-    def Verify(self, signature, message, origin_address):
-        pubkey = self.RecoverPubkey(message, signature)
-        pubkey.schnorr_verify(message,signature)
-        return (pubkey.serialize() == binascii.unhexlify(origin_address))
+    def Verify(self, base64sig, msg, address=None, ctx=None):
+        if address is None:
+            address=self.TaoAddress()
+        if len(base64sig) != 88:
+            raise Exception("Invalid base64 signature length")
 
-    def Sign(self, message):
-        rawpriv = self.PrivateKey()
-        priv = secp256k1.PrivateKey(privkey=rawpriv, raw=True)
-        raw_sig = priv.schnorr_sign(message)
-        return "%s" % raw_sig
+        msg = msg.encode('utf8')
+        fullmsg = (varint(len(self.msgprefix)) + self.msgprefix +
+                   varint(len(msg)) + msg)
+        hmsg = sha256(sha256(fullmsg).digest()).digest()
+
+        sigbytes = base64.b64decode(base64sig)
+        if len(sigbytes) != 65:
+            raise Exception("Invalid signature length")
+
+        compressed = (ord(sigbytes[0:1]) - 27) & 4 != 0
+        rec_id = (ord(sigbytes[0:1]) - 27) & 3
+
+        p = secp256k1.PublicKey(ctx=ctx, flags=ALL_FLAGS)
+        sig = p.ecdsa_recoverable_deserialize(sigbytes[1:], rec_id)
+
+        # Recover the ECDSA public key.
+        recpub = p.ecdsa_recover(hmsg, sig, raw=True)
+        pubser = secp256k1.PublicKey(recpub, ctx=ctx).serialize(compressed=compressed)
+
+        vh160=COINS["Tao"]['main']['prefix'].decode('hex')+hashlib.new('ripemd160', sha256(pubser).digest()).digest()
+        addr = Base58.check_encode(vh160)
+        return addr == address
+
+    def Sign(self, msg, compressed=True):
+        privkey = secp256k1.PrivateKey()
+        privkey.set_raw_privkey(self.PrivateKey())
+        msg = msg.encode('utf8')
+        fullmsg = (varint(len(self.msgprefix)) + self.msgprefix +
+                   varint(len(msg)) + msg)
+        hmsg = sha256(sha256(fullmsg).digest()).digest()
+
+        rawsig = privkey.ecdsa_sign_recoverable(hmsg, raw=True)
+        sigbytes, recid = privkey.ecdsa_recoverable_serialize(rawsig)
+
+        meta = 27 + recid
+        if compressed:
+            meta += 4
+
+        res = base64.b64encode(chr(meta).encode('utf8') + sigbytes)
+        return res
 
     def RecoverPubkey(self, message,signature):
+        if len(signature) != 65:
+            raise Exception("Invalid signature length")
         empty = secp256k1.PublicKey(flags=ALL_FLAGS)
+        sig = p.ecdsa_recoverable_deserialize(sigbytes[1:], rec_id)
+
         pubkey = empty.schnorr_recover(message,signature)
         return secp256k1.PublicKey(pubkey)
 
@@ -201,8 +254,7 @@ class Key(object):
             toadd = self.ser(T) + self.ser(U)
             toadd = chr(ord(toadd[0])-2+2*xoffset)+toadd[1:]
             r+=toadd
-
-        return base64.b64encode(self.public_header(pubkey,0) + r)
+        return zlib.compress(base64.b64encode(self.public_header(pubkey,0) + r))
 
     def pointSerToPoint(self,Aser, curved=SECP256k1.curve, generator=CURVE_GEN):
         _r  = generator.order()
@@ -217,7 +269,7 @@ class Key(object):
         P = generator
         pvk=string_to_int(self.PrivateKey())
         pubkeys = [self.ser((P*pvk),True), self.ser((P*pvk),False)]
-        enc = base64.b64decode(enc)
+        enc = base64.b64decode(zlib.decompress(enc))
 
         assert enc[:2]=='\x6a\x6a'      
 
@@ -524,7 +576,7 @@ class Key(object):
         print "   * Identifier"
         print "     * (hex):      ", self.Identifier().encode('hex')
         print "     * (fpr):      ", self.Fingerprint().encode('hex')
-        print "     * (main addr):", self.Address()
+        print "     * (main addr):", self.TaoAddress()
         if self.public is False:
             print "   * Secret key"
             print "     * (hex):      ", self.PrivateKey().encode('hex')
@@ -595,8 +647,11 @@ if __name__ == '__main__':
     key = Keyring("Testing").FromKeyspec("m")
     key.dump()
     enc = key.Encrypt(msg)
-    print "Encrypted: " + enc
+    print "Encrypted: " + str(len(enc))
     dec = key.Decrypt(enc)
     print "Decrypted: " 
     print dec
     assert (msg == dec[0])
+    sig = key.Sign(msg)
+    print "Signature: " + sig
+    print "Verify: ",key.Verify(sig,msg,key.TaoAddress())
