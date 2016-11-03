@@ -128,7 +128,7 @@ def genSentence(markovLength):
 
 def generateSentences(markovLength=5):
     # 5, because duh
-    buildMapping(wordlist(BASE_DIR+"english.txt"), markovLength)
+    buildMapping(wordlist(BASE_DIR+"/onering/english.txt"), markovLength)
     sentences = ""
     x=0
     while x < 3:

@@ -360,6 +360,8 @@ def get_piece_hashes(tree,height,npieces):
     for offset in range(startoffset,startoffset+npieces):
         hashes[offset-startoffset] = tree[offset]
     return hashes
+APP_ID=hasher("OneRing")
+DATA_VERSION=0x10001
 
 if __name__ == '__main__':
     print generate_password(21,0xFF49E2)

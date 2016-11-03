@@ -34,6 +34,9 @@
 # to U.S. embargoed destinations which include Cuba, Iraq, Libya, North Korea, 
 # Iran, Syria, Sudan, Afghanistan and any other country to which the U.S. has 
 # embargoed goods and services.
+#
+# The ECDSA version of ElGamal was originally conceived at https://github.com/jackjack-jj/jeeq
+#
 import os
 import binascii
 import hmac
@@ -41,7 +44,7 @@ import hashlib
 import ecdsa
 
 import struct
-import Base58
+import Base58, base64
 import secp256k1
 from secp256k1 import ALL_FLAGS
 
@@ -51,7 +54,7 @@ from hashlib import sha256
 from ecdsa.curves import SECP256k1
 from ecdsa.ecdsa import int_to_string, string_to_int
 from ecdsa.numbertheory import square_root_mod_prime as sqrt_mod
-
+import random
 import sqlite3 as db
 import utils
 from Crypto.Cipher import AES
@@ -68,7 +71,7 @@ CONFIG  =   {
                 'Version': 10001,
                 'EntropyBits': 128
             } 
-
+oneringversion='0.0.1'
 def create_keyspec():
     return binascii.hexlify(CreateKeyspec())
 
@@ -113,6 +116,15 @@ class Key(object):
         else:
             self.network = 'main'
 
+    def negative_self(self, point):
+        return ecdsa.ellipticcurve.Point( point.curve(), point.x(), -point.y(), point.order() )
+    def ser( self, point, comp=True ):
+        x = point.x()
+        y = point.y()
+        if comp:
+            return ( ('%02x'%(2+(y&1)))+('%064x'%x) ).decode('hex')
+        return ( '04'+('%064x'%x)+('%064x'%y) ).decode('hex')
+        
     def Verify(self, signature, message, origin_address):
         pubkey = self.RecoverPubkey(message, signature)
         pubkey.schnorr_verify(message,signature)
@@ -128,6 +140,125 @@ class Key(object):
         empty = secp256k1.PublicKey(flags=ALL_FLAGS)
         pubkey = empty.schnorr_recover(message,signature)
         return secp256k1.PublicKey(pubkey)
+
+    def ECC_YfromX(self,x,curved=SECP256k1.curve, odd=True):
+        _p = curved.p()
+        _a = curved.a()
+        _b = curved.b()
+        for offset in range(128):
+            Mx=x+offset
+            My2 = pow(Mx, 3, _p) + _a * pow(Mx, 2, _p) + _b % _p
+            My = pow(My2, (_p+1)/4, _p )
+
+            if curved.contains_point(Mx,My):
+                if odd == bool(My&1):
+                    return [My,offset]
+                return [_p-My,offset]
+        raise Exception('ECC_YfromX: No Y found')
+
+    def private_header(self,msg,v):
+        assert v<1, "Can't write version %d private header"%v
+        r=''
+        if v==0:
+            r+=('%08x'%len(msg)).decode('hex')
+            r+=sha256(msg).digest()[:2]
+        return ('%02x'%v).decode('hex') + ('%04x'%len(r)).decode('hex') + r
+
+    def public_header(self,pubkey,v):
+        assert v<1, "Can't write version %d public header"%v
+        r=''
+        if v==0:
+            r=sha256(pubkey).digest()[:2]
+        return '\x6a\x6a' + ('%02x'%v).decode('hex') + ('%04x'%len(r)).decode('hex') + r
+
+    def Encrypt(self, m,curved=SECP256k1.curve,generator=CURVE_GEN):
+        # ElGamal encryption for ECDSA key pairs
+        pubkey = self.CompressedPublicKey()
+        r=''
+        msg = self.private_header(m,0)+m
+        msg = msg+('\x00'*( 32-(len(msg)%32) ))
+        msgs = chunks(msg,32)
+
+        _r  = CURVE_ORDER
+
+        P = generator
+        if len(pubkey)==33: #compressed
+            pk = ecdsa.ellipticcurve.Point( curved, string_to_int(pubkey[1:33]), self.ECC_YfromX(string_to_int(pubkey[1:33]), curved, pubkey[0]=='\x03')[0], _r )
+        else:
+            pk = ecdsa.ellipticcurve.Point( curved, string_to_int(pubkey[1:33]), string_to_int(pubkey[33:65]), _r )
+
+        for g in msgs:
+            rand=( ( '%013x' % long(random.random() * 0xfffffffffffff) )*5 )
+
+            n = long(rand,16) >> 4
+            Mx = string_to_int(g)
+            My,xoffset=self.ECC_YfromX(Mx, curved)
+            M = ecdsa.ellipticcurve.Point( curved, Mx+xoffset, My, _r )
+
+            T = P*n
+            U = pk*n + M
+
+            toadd = self.ser(T) + self.ser(U)
+            toadd = chr(ord(toadd[0])-2+2*xoffset)+toadd[1:]
+            r+=toadd
+
+        return base64.b64encode(self.public_header(pubkey,0) + r)
+
+    def pointSerToPoint(self,Aser, curved=SECP256k1.curve, generator=CURVE_GEN):
+        _r  = generator.order()
+        assert Aser[0] in ['\x02','\x03','\x04']
+        if Aser[0] == '\x04':
+            return ecdsa.ellipticcurve.Point( curved, string_to_int(Aser[1:33]), string_to_int(Aser[33:]), _r )
+        Mx = string_to_int(Aser[1:])
+        return ecdsa.ellipticcurve.Point( curved, Mx, self.ECC_YfromX(Mx, curved, Aser[0]=='\x03')[0], _r )
+
+    def Decrypt(self,enc, curved=SECP256k1.curve, verbose=False, generator=CURVE_GEN):
+        # ElGamal dencryption for ECDSA key pairs
+        P = generator
+        pvk=string_to_int(self.PrivateKey())
+        pubkeys = [self.ser((P*pvk),True), self.ser((P*pvk),False)]
+        enc = base64.b64decode(enc)
+
+        assert enc[:2]=='\x6a\x6a'      
+
+        phv = string_to_int(enc[2])
+        assert phv==0, "Can't read version %d public header"%phv
+        hs = string_to_int(enc[3:5])
+        public_header=enc[5:5+hs]
+        checksum_pubkey=public_header[:2]
+
+        address=filter(lambda x:sha256(x).digest()[:2]==checksum_pubkey, pubkeys)
+        assert len(address)>0, 'Bad private key'
+        address=address[0]
+        enc=enc[5+hs:]
+
+
+        r = ''
+        for Tser,User in map(lambda x:[x[:33],x[33:]], chunks(enc,66)):
+            ots = ord(Tser[0])
+            xoffset = ots>>1
+            Tser = chr(2+(ots&1))+Tser[1:]
+            T = self.pointSerToPoint(Tser,curved,generator)
+            U = self.pointSerToPoint(User,curved,generator)
+
+            V = T*pvk
+            Mcalc = U+(self.negative_self(V))
+            r += ('%064x'%(Mcalc.x()-xoffset)).decode('hex')
+
+
+        pvhv = string_to_int(r[0])
+        assert pvhv==0, "Can't read version %d private header"%pvhv
+        phs = string_to_int(r[1:3])
+        private_header = r[3:3+phs]
+        size = string_to_int(private_header[:4])
+        checksum = private_header[4:6]
+        r = r[3+phs:]
+
+        msg = r[:size]
+        hashmsg = sha256(msg).digest()[:2]
+        checksumok = hashmsg==checksum        
+
+        return [msg, checksumok, address]
 
     # Static initializers to create from entropy or external formats
     #
@@ -249,7 +380,7 @@ class Key(object):
             return None
         secret = (b'\0'*32 + int_to_string(k_int))[-32:]
         
-        # Construct and return a new BIP32Key
+        # Construct and return a new Key
         return Key(secret=secret, chain=Ir, depth=self.depth+1, index=i, fpr=self.Fingerprint(), coin=self.coin, testnet=self.testnet, public=False)
 
     def CKDpub(self, i):
@@ -259,7 +390,7 @@ class Key(object):
         If the most significant bit of 'i' is set, this is
         an error.
 
-        Returns a BIP32Key constructed with the child key parameters,
+        Returns a Key constructed with the child key parameters,
         or None if index would result in invalid key.
         """
 
@@ -283,8 +414,8 @@ class Key(object):
         # Retrieve public key based on curve point
         K_i = ecdsa.VerifyingKey.from_public_point(point, curve=SECP256k1)
 
-        # Construct and return a new BIP32Key
-        return BIP32Key(secret=K_i, chain=Ir, depth=self.depth, index=i, fpr=self.Fingerprint(), coin=self.coin, testnet=self.testnet, public=True)
+        # Construct and return a new Key
+        return Key(secret=K_i, chain=Ir, depth=self.depth, index=i, fpr=self.Fingerprint(), coin=self.coin, testnet=self.testnet, public=True)
 
     # Public methods
     #
@@ -397,7 +528,8 @@ class Key(object):
         if self.public is False:
             print "   * Secret key"
             print "     * (hex):      ", self.PrivateKey().encode('hex')
-            print "     * (wif):      ", self.WalletImportFormat()
+            print "     * (taowif):   ", self.TaoWalletImportFormat()
+            print "     * (btcwif):   ", self.BitcoinWalletImportFormat()
         print "   * Public key"
         print "     * (hex):      ", self.CompressedPublicKey().encode('hex')
         print "   * Chain code"
@@ -457,3 +589,14 @@ class Keyring(object):
             key = key.ChildKey(node + _HARDEN)
         return key
 
+if __name__ == '__main__':
+    msg = "This is a test message."
+    print msg
+    key = Keyring("Testing").FromKeyspec("m")
+    key.dump()
+    enc = key.Encrypt(msg)
+    print "Encrypted: " + enc
+    dec = key.Decrypt(enc)
+    print "Decrypted: " 
+    print dec
+    assert (msg == dec[0])
