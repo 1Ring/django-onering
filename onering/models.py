@@ -48,7 +48,7 @@ class Identity(models.Model):
     def save_to_blockchain(self):
         if settings.TAO_WALLET is None:
             raise ValueError('The Tao Wallet is not configured!')
-        commit_object("identity",obj,self)
+        commit_object("identity",self,self)
     def create(self,paragraph=None):
         if self.paragraph is None:
             self.paragraph = generateSentences()
@@ -100,7 +100,7 @@ class Key(models.Model):
     def save_to_blockchain(self,action):
         if settings.TAO_WALLET is None:
             raise Exception('The Tao Wallet is not configured!')
-        commit_object("key",obj,self)
+        commit_object("key",self,self)
     def get_keyspec(self):
         return binascii.unhexlify(self.keyspec)
     def set_keyspec(self, ks):
