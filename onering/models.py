@@ -18,7 +18,10 @@ import pickle
 def commit_object(obj_type,obj,iden):
     data = BytesIO()
     creator = iden.Key("m").TaoAddress()
-    pickle.dump(obj,data)
+    data_dict = dict([(f.attname, getattr(obj, f.attname))
+                   for f in obj._meta.get_fields()
+                   if hasattr(f, 'attname')])
+    pickle.dump(data_dict,data)
     enc = iden.Key("m").Encrypt(data.getvalue())
     msg = binascii.hexlify(hasher(enc))
     sig = iden.Key("m").Sign(msg)
@@ -43,8 +46,18 @@ def commit_object(obj_type,obj,iden):
     else:
         raise Exception("Signature failed.")
 
+class IdentityManager(models.Manager):
+    use_for_related_fields = True
+    def for_creator(self, creator):
+        return Identity.objects.get_queryset().filter(creator=creator)
+    def for_split(self, name, creator):
+        return Identity.objects.get_queryset().filter(name=name,creator=creator)    
+
 class Identity(models.Model):
+    objects = models.Manager()
+    live = IdentityManager()
     paragraph = models.CharField(max_length=800,null=True, blank=True)
+    creator=models.CharField(max_length=34,null=True, blank=True)
     def save_to_blockchain(self):
         if settings.TAO_WALLET is None:
             raise ValueError('The Tao Wallet is not configured!')
@@ -54,6 +67,7 @@ class Identity(models.Model):
             self.paragraph = generateSentences()
         else:
             self.paragraph = paragraph
+        creator=self.Key("m").TaoAddress()
         self.save_to_blockchain()
     def passphrase(self):
         return hasher(self.paragraph)
@@ -93,7 +107,12 @@ class Identity(models.Model):
 def create_ks():
     return create_keyspec()
 
+class KeyManager(models.Manager):
+    use_for_related_fields = True
+
 class Key(models.Model):
+    objects = models.Manager()
+    live = KeyManager()
     parent = models.ForeignKey("Key",null=True, blank=True)
     keyspec = models.CharField(max_length=800,null=True, blank=True,default=create_ks)
     identity = models.ForeignKey("Identity",null=False, blank=True)
